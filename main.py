@@ -1,22 +1,49 @@
+"""
+Leitor NFC-e & Faturas API  (v7.0.1)
+
+Novidades em relação à 6.2.0
+- Autenticação opcional por token (APP_TOKEN + header X-App-Token) nas rotas /api/*.
+- URL do Apps Script pode ficar SÓ no servidor (WEBHOOK_URL): o front não precisa mais conhecê-la.
+  WEBHOOK_SECRET (opcional) é repassado ao Apps Script, que recusa chamadas sem ele.
+- Memória de categorias também gravada na planilha (aba Memoria_Categorias): não se perde
+  em deploys do Render. SQLite continua como cache local (agora com WAL, timeout e caminho configurável).
+- chave_memoria remove apenas MEDIDAS (500ML, 2L, 4UN...), não qualquer token com número.
+- Validações: parcelas 1..24, valor > 0, data válida, forma de pagamento.
+- SEFAZ: somente https; cada redirecionamento é validado ANTES de ser seguido.
+- Total da nota: regex de valor em formato BRL estrito (com R$ opcional) + fallback em <input value="...">.
+- CNPJ: não usa mais "qualquer CNPJ do texto" (evita pegar o da software house).
+- brl_para_decimal: "1.234" (sem vírgula) = 1234.
+- Recusas do Apps Script viram erro HTTP (409 duplicada / 400 demais), não "sucesso falso".
+"""
+import hmac
+import logging
 import os
 import re
 import sqlite3
+import time
 import unicodedata
 from contextlib import closing
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-VERSAO = "6.2.0"
+VERSAO = "7.0.1"
+log = logging.getLogger("nfce")
 
+# --------------------------------------------------------------------------- #
+# Configuração (variáveis de ambiente)
+# --------------------------------------------------------------------------- #
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-DB_PATH = os.getenv("CATEGORIAS_DB", "categorias_aprendidas.db")
+APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
+WEBHOOK_URL_ENV = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 DOMINIOS_SEFAZ = tuple(
     d.strip().lower()
     for d in os.getenv(
@@ -29,9 +56,27 @@ HEADERS_HTTP = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
+FORMAS_PAGAMENTO = ("À vista", "Crédito")
+MAX_PARCELAS = 24
+
+
+def _caminho_db() -> str:
+    if os.getenv("CATEGORIAS_DB"):
+        return os.environ["CATEGORIAS_DB"]
+    # Render com Persistent Disk montado em /data
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return "/data/categorias_aprendidas.db"
+    return "categorias_aprendidas.db"
+
+
+DB_PATH = _caminho_db()
+
+if "*" in ALLOWED_ORIGINS:
+    log.warning("ALLOWED_ORIGINS='*': defina o domínio do seu front em produção.")
+if not APP_TOKEN:
+    log.warning("APP_TOKEN não definido: qualquer pessoa com a URL pode usar a API.")
 
 app = FastAPI(title="Leitor NFC-e & Faturas API", version=VERSAO)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -40,19 +85,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def exigir_token(x_app_token: Optional[str] = Header(default=None)):
+    """Se APP_TOKEN estiver configurado, exige o header X-App-Token."""
+    if not APP_TOKEN:
+        return
+    recebido = (x_app_token or "").encode("utf-8")
+    if not hmac.compare_digest(recebido, APP_TOKEN.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Senha de acesso inválida ou ausente.")
+
+
 # --------------------------------------------------------------------------- #
 # Utilidades
 # --------------------------------------------------------------------------- #
+def _sem_acento_upper(texto: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", texto or "")
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).upper()
+
+
 def normalizar_texto(texto: str) -> str:
     """Maiúsculas, sem acentos, sem pontuação (mantém / para 'C/ GAS')."""
-    nfkd = unicodedata.normalize("NFKD", texto or "")
-    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
-    limpo = re.sub(r"[^A-Z0-9/ ]+", " ", sem_acento.upper())
+    limpo = re.sub(r"[^A-Z0-9/ ]+", " ", _sem_acento_upper(texto))
     return re.sub(r"\s+", " ", limpo).strip()
 
 
 def brl_para_decimal(valor) -> Optional[Decimal]:
-    """'1.234,56' / 'R$ 12,90' -> Decimal. None se não for número."""
+    """'1.234,56' / 'R$ 12,90' / '1.234' -> Decimal. None se não for número."""
     if valor is None:
         return None
     s = re.sub(r"[^\d,.\-]", "", str(valor))
@@ -60,15 +118,12 @@ def brl_para_decimal(valor) -> Optional[Decimal]:
         return None
     if "," in s:
         s = s.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"-?\d{1,3}(\.\d{3})+", s):  # "1.234" = mil duzentos e trinta e quatro
+        s = s.replace(".", "")
     try:
         return Decimal(s)
     except InvalidOperation:
         return None
-
-
-def para_float(valor) -> Optional[float]:
-    d = brl_para_decimal(valor)
-    return float(d) if d is not None else None
 
 
 def formatar_brl(d: Decimal) -> str:
@@ -76,7 +131,9 @@ def formatar_brl(d: Decimal) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Regras de categorização
+# Regras de categorização  (EDITE AQUI)
+#   Termos casam por PALAVRA INTEIRA (CUCA não casa em ACUCAR) e aceitam plural com S.
+#   Terminado em * = prefixo ("BOVIN*" -> BOVINA, BOVINO).
 # --------------------------------------------------------------------------- #
 REGRAS_LOJA_PRIORITARIA_BRUTAS = [
     ("Restaurante", ["RESTAURANTE", "CHURRASCARIA", "PIZZARIA", "HAMBURGUERIA", "LANCHERIA",
@@ -201,31 +258,40 @@ def melhor_categoria(texto_norm: str, regras: List[Regra]) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Memória de correções (SQLite com migração automática de esquema antigo)
+# Memória de correções: SQLite local + aba "Memoria_Categorias" na planilha
 # --------------------------------------------------------------------------- #
+_MEDIDA = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*(?:LITROS?|LTS?|ML|L|KG|GR?|UND?|CX|PCT?|PC|MM|CM|M)\b"
+)
+
+
 def chave_memoria(descricao: str) -> str:
-    """COCA COLA 2L e COCA COLA 600ML viram a mesma chave (remove tokens com números)."""
-    tokens = [t for t in normalizar_texto(descricao).split() if not any(c.isdigit() for c in t)]
-    return " ".join(tokens)
+    """
+    Remove só MEDIDAS: 'COCA COLA 2L' e 'COCA COLA 600ML' viram 'COCA COLA';
+    'PILHA AA' e 'PILHA AAA 4UN' continuam distintas. Se sobrar vazio, usa o texto todo.
+    """
+    sem_medida = _MEDIDA.sub(" ", _sem_acento_upper(descricao))
+    return normalizar_texto(sem_medida) or normalizar_texto(descricao)
 
 
 def _conectar() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.execute("CREATE TABLE IF NOT EXISTS aprendidas (chave TEXT PRIMARY KEY, categoria TEXT NOT NULL)")
-
-    colunas = [row[1] for row in con.execute("PRAGMA table_info(aprendidas)").fetchall()]
-    if "descricao_norm" in colunas and "chave" not in colunas:
-        antigas = con.execute("SELECT descricao_norm, categoria FROM aprendidas").fetchall()
-        with con:
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
+    with con:  # transação única: criação + migração
+        con.execute("CREATE TABLE IF NOT EXISTS aprendidas (chave TEXT PRIMARY KEY, categoria TEXT NOT NULL)")
+        colunas = [row[1] for row in con.execute("PRAGMA table_info(aprendidas)").fetchall()]
+        if "descricao_norm" in colunas and "chave" not in colunas:
+            antigas = con.execute("SELECT descricao_norm, categoria FROM aprendidas").fetchall()
             con.execute("DROP TABLE aprendidas")
             con.execute("CREATE TABLE aprendidas (chave TEXT PRIMARY KEY, categoria TEXT NOT NULL)")
             for desc_antiga, cat in antigas:
-                nova_chave = chave_memoria(desc_antiga)
-                if nova_chave and cat:
-                    con.execute(
-                        "INSERT OR REPLACE INTO aprendidas(chave, categoria) VALUES(?, ?)",
-                        (nova_chave, cat),
-                    )
+                nova = chave_memoria(desc_antiga)
+                if nova and cat:
+                    con.execute("INSERT OR REPLACE INTO aprendidas(chave, categoria) VALUES(?, ?)", (nova, cat))
     return con
 
 
@@ -233,20 +299,49 @@ def carregar_memoria() -> Dict[str, str]:
     try:
         with closing(_conectar()) as con:
             return dict(con.execute("SELECT chave, categoria FROM aprendidas").fetchall())
-    except sqlite3.Error:
+    except sqlite3.Error as e:
+        log.warning("SQLite indisponível: %s", e)
         return {}
 
 
-def salvar_memoria(descricao: str, categoria: str) -> None:
-    chave = chave_memoria(descricao)
-    if not chave:
-        raise ValueError("Descrição inválida para aprendizado.")
+def salvar_memoria(chave: str, categoria: str) -> None:
     with closing(_conectar()) as con, con:
         con.execute(
             "INSERT INTO aprendidas(chave, categoria) VALUES(?, ?) "
             "ON CONFLICT(chave) DO UPDATE SET categoria = excluded.categoria",
             (chave, categoria),
         )
+
+
+_cache_planilha = {"url": "", "ts": 0.0, "dados": {}}
+CACHE_TTL_S = 60
+
+
+def memoria_da_planilha(url: Optional[str]) -> Dict[str, str]:
+    """Lê a aba Memoria_Categorias via Apps Script (cache de 60 s; falha = ignora)."""
+    if not url:
+        return {}
+    agora = time.time()
+    if _cache_planilha["url"] == url and agora - _cache_planilha["ts"] < CACHE_TTL_S:
+        return _cache_planilha["dados"]
+    try:
+        params = {"acao": "memoria"}
+        if WEBHOOK_SECRET:
+            params["segredo"] = WEBHOOK_SECRET
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        bruto = resp.json().get("memoria") or {}
+        dados = {str(k): str(v) for k, v in bruto.items()} if isinstance(bruto, dict) else {}
+        _cache_planilha.update(url=url, ts=agora, dados=dados)
+    except (requests.RequestException, ValueError, AttributeError) as e:
+        log.warning("Memória da planilha indisponível: %s", e)
+        if _cache_planilha["url"] != url:
+            return {}
+    return _cache_planilha["dados"]
+
+
+def memoria_completa(url: Optional[str]) -> Dict[str, str]:
+    return {**carregar_memoria(), **memoria_da_planilha(url)}  # planilha prevalece
 
 
 def classificar(descricao: str, estabelecimento: str = "",
@@ -277,7 +372,7 @@ def url_sefaz_valida(url: str) -> bool:
     except ValueError:
         return False
     host = (p.hostname or "").lower()
-    return p.scheme in ("http", "https") and any(host == d or host.endswith("." + d) for d in DOMINIOS_SEFAZ)
+    return p.scheme == "https" and any(host == d or host.endswith("." + d) for d in DOMINIOS_SEFAZ)
 
 
 def validar_webhook(url: str) -> str:
@@ -288,34 +383,69 @@ def validar_webhook(url: str) -> str:
     return url
 
 
+def resolver_webhook(url_req: Optional[str], obrigatorio: bool = True) -> Optional[str]:
+    """Prioriza a URL configurada no servidor (WEBHOOK_URL); senão usa a enviada pelo front."""
+    if WEBHOOK_URL_ENV:
+        return WEBHOOK_URL_ENV
+    url = (url_req or "").strip()
+    if not url:
+        if obrigatorio:
+            raise HTTPException(status_code=400, detail="Informe a URL do Apps Script (ou configure WEBHOOK_URL no servidor).")
+        return None
+    return validar_webhook(url)
+
+
 def chamar_webhook(metodo: str, url: str, payload: Optional[dict] = None):
     try:
-        resp = requests.post(url, json=payload, timeout=25) if metodo == "POST" else requests.get(url, timeout=25)
+        if metodo == "POST":
+            corpo = dict(payload or {})
+            if WEBHOOK_SECRET:
+                corpo["segredo"] = WEBHOOK_SECRET
+            resp = requests.post(url, json=corpo, timeout=25)
+        else:
+            resp = requests.get(url, params={"segredo": WEBHOOK_SECRET} if WEBHOOK_SECRET else None, timeout=25)
         resp.raise_for_status()
-        return resp.json()
+        dados = resp.json()
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Falha ao falar com o Google Apps Script: {e}")
     except ValueError:
         raise HTTPException(status_code=502, detail="O Apps Script não retornou JSON válido (confira a implantação).")
 
+    if isinstance(dados, dict) and dados.get("sucesso") is False:
+        status = 409 if dados.get("duplicada") else 400
+        raise HTTPException(status_code=status, detail=dados.get("erro") or "Operação recusada pelo Apps Script.")
+    return dados
+
 
 def baixar_soup(sessao: requests.Session, url: str) -> BeautifulSoup:
-    if not url_sefaz_valida(url):
-        raise HTTPException(status_code=400, detail="URL inválida ou fora dos domínios oficiais da SEFAZ/RS.")
-    try:
-        resp = sessao.get(url.strip(), headers=HEADERS_HTTP, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao acessar a SEFAZ: {e}")
-    if not url_sefaz_valida(resp.url):
-        raise HTTPException(status_code=400, detail="A SEFAZ redirecionou para um domínio não permitido.")
-    return BeautifulSoup(resp.content, "html.parser")
+    """Segue redirecionamentos manualmente, validando CADA destino antes de acessá-lo."""
+    atual = (url or "").strip()
+    for _ in range(5):
+        if not url_sefaz_valida(atual):
+            raise HTTPException(status_code=400, detail="URL inválida ou fora dos domínios oficiais da SEFAZ/RS (https).")
+        try:
+            resp = sessao.get(atual, headers=HEADERS_HTTP, timeout=20, allow_redirects=False)
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Falha ao acessar a SEFAZ: {e}")
+        if resp.is_redirect:
+            destino = resp.headers.get("Location")
+            if not destino:
+                raise HTTPException(status_code=502, detail="Redirecionamento inválido da SEFAZ.")
+            atual = urljoin(atual, destino)
+            continue
+        try:
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Falha ao acessar a SEFAZ: {e}")
+        return BeautifulSoup(resp.content, "html.parser")  # bytes: o bs4 detecta o encoding
+    raise HTTPException(status_code=502, detail="Redirecionamentos demais ao acessar a SEFAZ.")
 
 
 # --------------------------------------------------------------------------- #
 # Extração
 # --------------------------------------------------------------------------- #
-_NUMERO = re.compile(r"\d[\d.,]*")
+_NUMERO = re.compile(r"\d[\d.,]*")  # começa por dígito: não casa o "." de "Qtde.:"
+_BRL = r"(\d{1,3}(?:\.\d{3})+,\d{2}|\d+,\d{2})"
 
 
 def _numero(el, padrao: str) -> str:
@@ -331,14 +461,10 @@ def _extrair_produtos(soup: BeautifulSoup, estabelecimento: str, memoria: Dict[s
     def adicionar(codigo, descricao, quantidade, unidade, valor_unitario, valor_total):
         categoria, origem = classificar(descricao, estabelecimento, memoria)
         produtos.append({
-            "codigo": codigo,
-            "descricao": descricao,
-            "categoria": categoria,
-            "categoria_origem": origem,
-            "quantidade": quantidade,
-            "unidade": unidade,
-            "valor_unitario": valor_unitario,
-            "valor_total": valor_total,
+            "codigo": codigo, "descricao": descricao,
+            "categoria": categoria, "categoria_origem": origem,
+            "quantidade": quantidade, "unidade": unidade,
+            "valor_unitario": valor_unitario, "valor_total": valor_total,
         })
 
     for tr in soup.select('tr[id^="Item"]'):
@@ -360,7 +486,7 @@ def _extrair_produtos(soup: BeautifulSoup, estabelecimento: str, memoria: Dict[s
             vtot.get_text(" ", strip=True) if vtot else valor_unitario,
         )
 
-    if not produtos:
+    if not produtos:  # layout alternativo em colunas
         for tr in soup.select('tr[class*="NFCDetalhe_Item"]'):
             c = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(c) >= 6:
@@ -370,19 +496,35 @@ def _extrair_produtos(soup: BeautifulSoup, estabelecimento: str, memoria: Dict[s
 
 def extrair_total_nota(soup: BeautifulSoup, texto: str, soma_itens: Decimal) -> Tuple[str, str]:
     """Retorna (valor, origem). Prioriza o RÓTULO, nunca a posição do elemento."""
-    for origem, regex in (
-        ("valor_a_pagar", r"Valor\s+a\s+pagar\s*R\$\s*:?\s*(\d[\d.,]*)"),
-        ("valor_total", r"Valor\s+total\s*R\$\s*:?\s*(\d[\d.,]*)"),
-    ):
-        m = re.search(regex, texto, re.IGNORECASE)
+    for origem, rotulo in (("valor_a_pagar", r"Valor\s+a\s+pagar"), ("valor_total", r"Valor\s+total")):
+        m = re.search(rotulo + r"\s*(?:\(?\s*R\$\s*\)?)?\s*:?\s*" + _BRL, texto, re.IGNORECASE)
         if m and (brl_para_decimal(m.group(1)) or Decimal(0)) > 0:
             return m.group(1), origem
 
     el = soup.select_one("span.totalNumb.txtMax")
-    if el and (brl_para_decimal(el.get_text()) or Decimal(0)) > 0:
-        return el.get_text(strip=True), "css_txtMax"
+    if el:
+        m = re.search(_BRL, el.get_text(" ", strip=True))
+        if m and (brl_para_decimal(m.group(1)) or Decimal(0)) > 0:
+            return m.group(1), "css_txtMax"
+
+    # Alguns layouts guardam o total em <input value="12,34">
+    for inp in soup.select("input[value]"):
+        nome = f"{inp.get('id', '')} {inp.get('name', '')}".lower()
+        if "pagar" in nome or "total" in nome:
+            m = re.fullmatch(_BRL, (inp.get("value") or "").strip())
+            if m and (brl_para_decimal(m.group(1)) or Decimal(0)) > 0:
+                return m.group(1), "input_value"
 
     return formatar_brl(soma_itens), "soma_itens"
+
+
+def _extrair_cnpj(texto: str) -> str:
+    m = re.search(r"CNPJ\s*:\s*(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})", texto, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Fallback só no cabeçalho (o emitente vem primeiro; CNPJs no rodapé são de terceiros)
+    m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto[:1200])
+    return m.group(1) if m else "Não identificado"
 
 
 def parsear_nfce(soup: BeautifulSoup, url_original: str, memoria: Dict[str, str]) -> dict:
@@ -390,10 +532,7 @@ def parsear_nfce(soup: BeautifulSoup, url_original: str, memoria: Dict[str, str]
 
     estab_el = soup.select_one("#u20, .txtTopo, .NFCCabecalho_SubTitulo")
     estabelecimento = estab_el.get_text(" ", strip=True) if estab_el else "Estabelecimento"
-
-    m_cnpj = (re.search(r"CNPJ\s*:\s*(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})", texto, re.IGNORECASE)
-              or re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto))
-    cnpj = m_cnpj.group(1) if m_cnpj else "Não identificado"
+    cnpj = _extrair_cnpj(texto)
 
     m_data = (re.search(r"Emiss[aã]o\s*:?\s*(\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)", texto, re.IGNORECASE)
               or re.search(r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}(?::\d{2})?)", texto))
@@ -418,7 +557,8 @@ def parsear_nfce(soup: BeautifulSoup, url_original: str, memoria: Dict[str, str]
 
     resumo: Dict[str, Decimal] = {}
     for p in produtos:
-        resumo[p["categoria"]] = resumo.get(p["categoria"], Decimal(0)) + (brl_para_decimal(p["valor_total"]) or Decimal(0))
+        v = brl_para_decimal(p["valor_total"]) or Decimal(0)
+        resumo[p["categoria"]] = resumo.get(p["categoria"], Decimal(0)) + v
 
     return {
         "chave_acesso": chave,
@@ -442,56 +582,72 @@ def parsear_nfce(soup: BeautifulSoup, url_original: str, memoria: Dict[str, str]
 
 
 # --------------------------------------------------------------------------- #
-# Modelos
+# Modelos e validações
 # --------------------------------------------------------------------------- #
 class ProcessarRequest(BaseModel):
     url: str
+    webhook_url: Optional[str] = ""
 
 
 class CorrigirRequest(BaseModel):
     descricao: str
     categoria: str
+    webhook_url: Optional[str] = ""
 
 
 class SalvarSheetsRequest(BaseModel):
-    webhook_url: str
+    webhook_url: Optional[str] = ""
     chave_acesso: str = ""
     estabelecimento: str = ""
     cnpj: str = ""
     data_emissao: str = ""
     valor_total_nota: str = "0,00"
     forma_pagamento: str = "À vista"
-    parcelas: int = 1
-    produtos: List[dict] = []
+    parcelas: int = Field(1, ge=1, le=MAX_PARCELAS)
+    produtos: List[dict] = Field(default_factory=list)
 
 
 class CompraOnlineRequest(BaseModel):
-    webhook_url: str
+    webhook_url: Optional[str] = ""
     descricao: str
     data_emissao: str = ""
     categoria: str = "Outros"
     valor_total_nota: str = "0,00"
     forma_pagamento: str = "Crédito"
-    parcelas: int = 1
+    parcelas: int = Field(1, ge=1, le=MAX_PARCELAS)
 
 
 class DashboardRequest(BaseModel):
-    webhook_url: str
+    webhook_url: Optional[str] = ""
 
 
 class ExcluirRequest(BaseModel):
-    webhook_url: str
+    webhook_url: Optional[str] = ""
     identificador: str
 
 
-def _dump(m: BaseModel) -> dict:
-    return m.model_dump() if hasattr(m, "model_dump") else m.dict()
+def validar_lancamento(valor_total: str, data_br: str, forma: str) -> None:
+    d = brl_para_decimal(valor_total)
+    if d is None or d <= 0:
+        raise HTTPException(status_code=400, detail="Valor total inválido (R$ 0,00). Verifique antes de salvar.")
+    m = re.search(r"(\d{2})/(\d{2})/(\d{4})", data_br or "")
+    try:
+        if not m:
+            raise ValueError
+        datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Data inválida ou não identificada. Informe a data da compra.")
+    if forma not in FORMAS_PAGAMENTO:
+        raise HTTPException(status_code=400, detail="Forma de pagamento inválida.")
+
+
+CAMPOS_ITEM = ("codigo", "descricao", "quantidade", "unidade", "valor_unitario", "valor_total", "categoria")
 
 
 # --------------------------------------------------------------------------- #
 # Rotas
 # --------------------------------------------------------------------------- #
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "Servidor rodando com sucesso!", "versao": VERSAO}
 
@@ -501,57 +657,95 @@ def listar_categorias():
     return {"categorias": CATEGORIAS}
 
 
-@app.post("/api/processar-nfce")
+@app.post("/api/processar-nfce", dependencies=[Depends(exigir_token)])
 def processar_nfce(req: ProcessarRequest):
     sessao = requests.Session()
     soup = baixar_soup(sessao, req.url)
-    memoria = carregar_memoria()
+    memoria = memoria_completa(resolver_webhook(req.webhook_url, obrigatorio=False))
 
     if not soup.select('tr[id^="Item"], tr[class*="NFCDetalhe_Item"]'):
         iframe = soup.find("iframe", id="iframeConteudo") or soup.find("iframe")
         if iframe and iframe.get("src"):
             soup = baixar_soup(sessao, urljoin(req.url.strip(), iframe["src"]))
 
-    dados = parsear_nfce(soup, req.url, memoria)
-    return {"sucesso": True, "dados_extraidos": dados}
+    return {"sucesso": True, "dados_extraidos": parsear_nfce(soup, req.url, memoria)}
 
 
-@app.post("/api/corrigir-categoria")
+@app.post("/api/corrigir-categoria", dependencies=[Depends(exigir_token)])
 def corrigir_categoria(req: CorrigirRequest):
     categoria = req.categoria.strip()
     if not categoria or len(categoria) > 60:
         raise HTTPException(status_code=400, detail="Categoria inválida.")
+    chave = chave_memoria(req.descricao)
+    if not chave:
+        raise HTTPException(status_code=400, detail="Descrição vazia: não há o que aprender.")
+
+    salvo_em: List[str] = []
     try:
-        salvar_memoria(req.descricao, categoria)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        salvar_memoria(chave, categoria)
+        salvo_em.append("sqlite")
     except sqlite3.Error as e:
-        raise HTTPException(status_code=500, detail=f"Não foi possível salvar a correção: {e}")
-    return {"sucesso": True, "chave": chave_memoria(req.descricao), "categoria": categoria}
+        log.warning("Falha ao gravar no SQLite: %s", e)
+
+    webhook = resolver_webhook(req.webhook_url, obrigatorio=False)
+    if webhook:
+        try:
+            chamar_webhook("POST", webhook, {"tipo": "memoria", "chave": chave, "categoria": categoria})
+            salvo_em.append("planilha")
+            _cache_planilha["ts"] = 0.0
+        except HTTPException as e:
+            log.warning("Falha ao gravar memória na planilha: %s", e.detail)
+
+    if not salvo_em:
+        raise HTTPException(status_code=500, detail="Não foi possível salvar a correção (SQLite e planilha indisponíveis).")
+    return {"sucesso": True, "chave": chave, "categoria": categoria, "salvo_em": salvo_em}
 
 
-@app.post("/api/salvar-sheets")
+@app.post("/api/salvar-sheets", dependencies=[Depends(exigir_token)])
 def salvar_sheets(req: SalvarSheetsRequest):
-    url = validar_webhook(req.webhook_url)
-    payload = _dump(req)
-    payload["tipo"] = "nfce"
+    url = resolver_webhook(req.webhook_url)
+    forma = req.forma_pagamento
+    validar_lancamento(req.valor_total_nota, req.data_emissao, forma)
+    payload = {
+        "tipo": "nfce",
+        "chave_acesso": req.chave_acesso,
+        "estabelecimento": req.estabelecimento,
+        "cnpj": req.cnpj,
+        "data_emissao": req.data_emissao,
+        "valor_total_nota": req.valor_total_nota,
+        "forma_pagamento": forma,
+        "parcelas": 1 if forma == "À vista" else req.parcelas,
+        "produtos": [{k: item.get(k, "") for k in CAMPOS_ITEM} for item in req.produtos],
+    }
     return chamar_webhook("POST", url, payload)
 
 
-@app.post("/api/salvar-compra-online")
+@app.post("/api/salvar-compra-online", dependencies=[Depends(exigir_token)])
 def salvar_compra_online(req: CompraOnlineRequest):
-    url = validar_webhook(req.webhook_url)
-    payload = _dump(req)
-    payload["tipo"] = "online"
+    url = resolver_webhook(req.webhook_url)
+    if not req.descricao.strip():
+        raise HTTPException(status_code=400, detail="Informe a descrição da compra.")
+    validar_lancamento(req.valor_total_nota, req.data_emissao, req.forma_pagamento)
+    payload = {
+        "tipo": "online",
+        "descricao": req.descricao.strip(),
+        "data_emissao": req.data_emissao,
+        "categoria": req.categoria,
+        "valor_total_nota": req.valor_total_nota,
+        "forma_pagamento": req.forma_pagamento,
+        "parcelas": 1 if req.forma_pagamento == "À vista" else req.parcelas,
+    }
     return chamar_webhook("POST", url, payload)
 
 
-@app.post("/api/dados-dashboard")
+@app.post("/api/dados-dashboard", dependencies=[Depends(exigir_token)])
 def dados_dashboard(req: DashboardRequest):
-    return chamar_webhook("GET", validar_webhook(req.webhook_url))
+    return chamar_webhook("GET", resolver_webhook(req.webhook_url))
 
 
-@app.post("/api/excluir-lancamento")
+@app.post("/api/excluir-lancamento", dependencies=[Depends(exigir_token)])
 def excluir_lancamento(req: ExcluirRequest):
-    url = validar_webhook(req.webhook_url)
-    return chamar_webhook("POST", url, {"tipo": "excluir", "identificador": req.identificador})
+    url = resolver_webhook(req.webhook_url)
+    if not req.identificador.strip():
+        raise HTTPException(status_code=400, detail="Identificador não informado.")
+    return chamar_webhook("POST", url, {"tipo": "excluir", "identificador": req.identificador.strip()})
