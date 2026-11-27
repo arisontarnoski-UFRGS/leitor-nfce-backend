@@ -5,7 +5,7 @@ Novidades em relação à 6.2.0
 - Autenticação opcional por token (APP_TOKEN + header X-App-Token) nas rotas /api/*.
 - URL do Apps Script pode ficar SÓ no servidor (WEBHOOK_URL): o front não precisa mais conhecê-la.
   WEBHOOK_SECRET (opcional) é repassado ao Apps Script, que recusa chamadas sem ele.
-- Memória de categorias, também gravada na planilha (aba Memoria_Categorias): não se perde
+- Memória de categorias também gravada na planilha (aba Memoria_Categorias): não se perde
   em deploys do Render. SQLite continua como cache local (agora com WAL, timeout e caminho configurável).
 - chave_memoria remove apenas MEDIDAS (500ML, 2L, 4UN...), não qualquer token com número.
 - Validações: parcelas 1..24, valor > 0, data válida, forma de pagamento.
